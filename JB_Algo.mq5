@@ -245,6 +245,9 @@ input bool StochD_Confirm = false;
 input bool StochBothLines = false;
 input bool ShowConfidence = true;
 input double Conf_MinForIcon = 60.0;
+input bool UseRegimeAwareConfidence = true;
+input double Conf_Min_TrendStrong = 52.0;
+input double Conf_Min_TrendWeak = 72.0;
 input double FVG_ConfBonus = 10.0;
 input double Conf_OverrideLevel = 88.0;
 input bool EnableConfluenceOverride = true; // allow high-confidence entries when some trend filters disagree
@@ -291,6 +294,7 @@ input double DrawdownStep2LotFactor = 0.25;
 input bool EnableHardRiskCaps = true;
 input double MaxRiskUSDPerTrade = 75.0;
 input double MaxRiskPctEquityPerTrade = 1.0;
+input double CommissionPerLotRoundTrip = 0.0; // broker round-trip commission per 1.0 lot
 input int MagicNumber = 88321;
 input int MaxPositions = 1;
 
@@ -351,6 +355,8 @@ input bool UseAccountLevelCap = false;
 input group "══ Daily Trade Limit ══"
 input bool EnableDailyTradeLimit = true;
 input int MaxTradesPerDay = 30;
+input bool EnableConsecLossBreaker = true;
+input int MaxConsecLossesPerDay = 3;
 
 input group "══ Volume Filter ══"
 input bool EnableVolume = true;
@@ -424,6 +430,7 @@ input bool   ShowSwingLevels      = false;   // [v5.35] Default FALSE for clean 
 input int    SwingLineExtend      = 20;      // [v5.35] Reduced from 80
 input color  SwingHighColor       = clrOrangeRed;    // color for swing high lines
 input color  SwingLowColor        = clrDodgerBlue;   // color for swing low lines
+input int    SwingMaxAgeBars      = 150;
 
 input group "══ Equity Curve Filter (D) ══"
 input bool EnableEquityCurveFilter = true;
@@ -461,11 +468,18 @@ input int DashboardInstanceID = 1;
 input bool TesterFastDashboard = true;
 input double MaxLotHardCap = 50.0;
 input bool DiagnosticsMode = false;
+input bool LogStochRSIFailures = true;
 input bool FailInitOnUnsafeLiveSettings = true; // block live attach when test-only/signal-killer flags are on
 input bool ShowEntryMoneyRisks = true;          // on-chart label: est. $ risk / reward at last open
 input bool ThrottleRiskChecks = true;           // run daily checks once per second
 input int RiskChecksIntervalSec = 1;
 input int HFT_PositionManageIntervalSec = 30;   // H4+ position manager throttle
+input double MinRRAtEntry = 1.5;
+input double MaxEstimatedRiskUSDAtEntry = 0.0; // 0=disabled
+input bool EnablePositionHealthMonitor = true;
+input int PositionHealthCheckMinutes = 5;
+input int MaxPositionAgeHours = 24;
+input datetime WFO_ForwardStartDate = 0;
 
 input group "══ Multi-Chart & Flexibility ══"
 input bool   UseCustomMagicPerSymbol = true;
@@ -559,6 +573,19 @@ int g_SellBlockBB=0, g_SellBlockStoch=0, g_SellBlockVol=0;
 double g_AvgConfTakenTrades = 0.0;
 int g_ConfTakenCount = 0;
 double g_EquityHistory[];
+int g_ConsecLossesToday = 0;
+bool g_ConsecLossBreakerHit = false;
+
+struct WFOStats
+{
+   int total;
+   int wins;
+   int losses;
+   double grossProfit;
+   double grossLoss;
+};
+WFOStats g_WFO_InSample;
+WFOStats g_WFO_Forward;
 
 //===================================================================
 // NEWS STATE
@@ -602,6 +629,12 @@ datetime g_LastRiskChecksAt = 0;
 datetime g_LastPosManageAt = 0;
 datetime g_LastIconBuyBar = 0;
 datetime g_LastIconSellBar = 0;
+datetime g_LastPosHealthCheck = 0;
+int g_StochFailShortBuffer = 0;
+int g_StochFailBounds = 0;
+int g_StochFailDeque = 0;
+int g_StochFailGeneral = 0;
+ENUM_TIMEFRAMES g_HTFHandlePeriod = PERIOD_CURRENT;
 
 //===================================================================
 // DASHBOARD CONSTANTS
@@ -831,13 +864,13 @@ void LoadMarketProfile()
          g_P.bb_deviation=2.0;g_P.max_bb_width=2.5;g_P.bb_min_atr_dist=0.5;
          g_P.session_start=8;g_P.session_end=17;
          g_P.risk_percent=0.5;g_P.sar_trail_buffer=0.5;g_P.daily_profit_cap=40.0;
-         g_P.daily_loss_pct=MaxDailyLossPercent; g_P.max_risk_usd=MaxOpenRiskUSD_AllSymbols; break;
+         g_P.daily_loss_pct=5.0; g_P.max_risk_usd=MaxOpenRiskUSD_AllSymbols; break;
       case SYMCLASS_STOCKS:
          g_P.atr_sl_multi=1.5;g_P.atr_tp_multi=2.5;g_P.adx_level=20.0;
          g_P.bb_deviation=2.0;g_P.max_bb_width=2.5;g_P.bb_min_atr_dist=0.5;
          g_P.session_start=14;g_P.session_end=21;
          g_P.risk_percent=0.3;g_P.sar_trail_buffer=0.4;g_P.daily_profit_cap=20.0;
-         g_P.daily_loss_pct=MaxDailyLossPercent; g_P.max_risk_usd=MaxOpenRiskUSD_AllSymbols; break;
+         g_P.daily_loss_pct=4.0; g_P.max_risk_usd=MaxOpenRiskUSD_AllSymbols; break;
       default:
          g_P.atr_sl_multi=isScalp?1.8:1.6;g_P.atr_tp_multi=isScalp?2.5:3.0;g_P.adx_level=22.0;
          g_P.bb_deviation=2.0;g_P.max_bb_width=2.5;g_P.bb_min_atr_dist=0.5;
@@ -932,6 +965,50 @@ double ResolvePartialTPMulti()
    return PartialTP_ATRMulti;
 }
 
+double ResolveConfThreshold(double adx)
+{
+   if(!UseRegimeAwareConfidence) return Conf_MinForIcon;
+   if(adx >= ADX_TrendStrong) return Conf_Min_TrendStrong;
+   if(adx < ADX_TrendWeak) return Conf_Min_TrendWeak;
+   return Conf_MinForIcon;
+}
+
+void UpdateWFOStats(double profit)
+{
+   if(WFO_ForwardStartDate<=0) return;
+   datetime nowT=TimeCurrent();
+   bool isForward=(nowT>=WFO_ForwardStartDate);
+   WFOStats &st=isForward?g_WFO_Forward:g_WFO_InSample;
+   st.total++;
+   if(profit>=0){ st.wins++; st.grossProfit+=profit; }
+   else{ st.losses++; st.grossLoss+=MathAbs(profit); }
+}
+
+void InvalidateBrokenSwingLevels(double closeNow)
+{
+   for(int i=0;i<SWING_MAX;i++)
+   {
+      if(g_SwingHighs[i].active && closeNow>g_SwingHighs[i].price) g_SwingHighs[i].active=false;
+      if(g_SwingLows[i].active && closeNow<g_SwingLows[i].price) g_SwingLows[i].active=false;
+      if(SwingMaxAgeBars>0)
+      {
+         datetime tNow=iTime(_Symbol,PERIOD_CURRENT,0);
+         int maxAgeSec=PeriodSeconds(PERIOD_CURRENT)*SwingMaxAgeBars;
+         if(g_SwingHighs[i].active && (tNow-g_SwingHighs[i].barTime)>maxAgeSec) g_SwingHighs[i].active=false;
+         if(g_SwingLows[i].active && (tNow-g_SwingLows[i].barTime)>maxAgeSec) g_SwingLows[i].active=false;
+      }
+   }
+}
+
+void EnsureHTFSarHandleFresh()
+{
+   ENUM_TIMEFRAMES need=ResolveHTFPeriod();
+   if(hSAR_HTF!=INVALID_HANDLE && g_HTFHandlePeriod==need) return;
+   if(hSAR_HTF!=INVALID_HANDLE) IndicatorRelease(hSAR_HTF);
+   hSAR_HTF=iSAR(_Symbol,need,SAR_Step,SAR_Maximum);
+   g_HTFHandlePeriod=need;
+}
+
 //===================================================================
 // INPUT VALIDATION
 //===================================================================
@@ -992,12 +1069,17 @@ void DetectNewFVG(double atr, bool isHTF = false)
    if(!ShowFVG && !ShowiFVG && !isHTF) return;
 
    ENUM_TIMEFRAMES tf = isHTF ? HTF_FVG_Period : PERIOD_CURRENT;
+   int tfSec=PeriodSeconds(tf);
+   datetime t0=iTime(_Symbol,tf,0), t1=iTime(_Symbol,tf,1), t2=iTime(_Symbol,tf,2);
+   if(tfSec<=0 || t0<=0 || t1<=0 || t2<=0) return;
+   if((t0-t1)<tfSec) return; // bar-1 closure safety
+   if(t2==t0) return;        // never tag current opening bar as FVG midTime
 
    double high3  = iHigh(_Symbol, tf, 3);
    double low3   = iLow (_Symbol, tf, 3);
    double high1  = iHigh(_Symbol, tf, 1);
    double low1   = iLow (_Symbol, tf, 1);
-   datetime midT = iTime(_Symbol, tf, 2);
+   datetime midT = t2;
 
    double minSz = (FVGMinSizeATR>0 && atr>0) ? FVGMinSizeATR*atr : 0;
    double maxSz = (FVGMaxSizeATR>0 && atr>0) ? FVGMaxSizeATR*atr : DBL_MAX;
@@ -1185,10 +1267,15 @@ void DetectNewOB(double atr, bool isHTF = false)
    if(!ShowOB && !isHTF) return;
 
    ENUM_TIMEFRAMES tf = isHTF ? HTF_OB_Period : PERIOD_CURRENT;
+   int tfSec=PeriodSeconds(tf);
+   datetime t0=iTime(_Symbol,tf,0), t1t=iTime(_Symbol,tf,1), t2t=iTime(_Symbol,tf,2);
+   if(tfSec<=0 || t0<=0 || t1t<=0 || t2t<=0) return;
+   if((t0-t1t)<tfSec) return;
+
    double o3=iOpen(_Symbol,tf,3), h3=iHigh(_Symbol,tf,3), l3=iLow(_Symbol,tf,3), c3=iClose(_Symbol,tf,3);
    double o2=iOpen(_Symbol,tf,2), h2=iHigh(_Symbol,tf,2), l2=iLow(_Symbol,tf,2), c2=iClose(_Symbol,tf,2);
    double o1=iOpen(_Symbol,tf,1), h1=iHigh(_Symbol,tf,1), l1=iLow(_Symbol,tf,1), c1=iClose(_Symbol,tf,1);
-   datetime obTime=iTime(_Symbol,tf,2);
+   datetime obTime=t2t;
    double atrRef=(atr>0.0)?atr:g_LastATR;
    double minSize=(OB_MinSizeATR>0.0&&atrRef>0.0)?(OB_MinSizeATR*atrRef):0.0;
    if((h2-l2)<minSize) return;
@@ -1196,9 +1283,14 @@ void DetectNewOB(double atr, bool isHTF = false)
    double impulseRange=MathMax(h1-l1,_Point);
    double bodyRatio=MathAbs(c1-o1)/impulseRange;
    if(bodyRatio<OB_MinBodyRatio) return;
+   double obRange=MathMax(h2-l2,_Point);
+   double obBodyRatio=MathAbs(c2-o2)/obRange;
+   if(obBodyRatio<0.45) return;
 
    bool bullOB=(c2<o2)&&(c1>h2)&&((l1-h3)>0.0);
    bool bearOB=(c2>o2)&&(c1<l2)&&((l3-h1)>0.0);
+   if(bullOB && ((c1-h2)<minSize)) bullOB=false;
+   if(bearOB && ((l2-c1)<minSize)) bearOB=false;
    if(!bullOB && !bearOB) return;
 
    if(isHTF)
@@ -2057,8 +2149,9 @@ void UpdateDashboard()
    }
    buyConf  = MathMin(100,MathMax(0,buyConf));
    sellConf = MathMin(100,MathMax(0,sellConf));
-   string cB=(buyConf>=Conf_MinForIcon)?"++":((buyConf>=40)?"~~":"--");
-   string cS=(sellConf>=Conf_MinForIcon)?"++":((sellConf>=40)?"~~":"--");
+   double confMinDyn=ResolveConfThreshold(adxBuf[1]);
+   string cB=(buyConf>=confMinDyn)?"++":((buyConf>=40)?"~~":"--");
+   string cS=(sellConf>=confMinDyn)?"++":((sellConf>=40)?"~~":"--");
    g_DashValues[6]  = StringFormat("%s %.0f%% / %s %.0f%%",cB,buyConf,cS,sellConf);
    int bullFVG=CountFVGByType(true), bearFVG=CountFVGByType(false);
    int bullOB=CountOBByType(true), bearOB=CountOBByType(false);
@@ -2325,9 +2418,10 @@ double CalcLot(double atr)
    if(UseRiskPercent && atr>0)
    {
       double rA=eq*g_P.risk_percent/100.0;
+      double commissionPerLot=MathMax(0.0,CommissionPerLotRoundTrip);
       if(EnableHardRiskCaps)
       {
-         double usdCap=MathMax(0.0,MaxRiskUSDPerTrade);
+         double usdCap=MathMax(0.0,(UseMarketProfile&&g_P.max_risk_usd>0.0)?g_P.max_risk_usd:MaxRiskUSDPerTrade);
          double pctCap=eq*MathMax(0.0,MaxRiskPctEquityPerTrade)/100.0;
          double hardCap=(usdCap>0.0&&pctCap>0.0)?MathMin(usdCap,pctCap):MathMax(usdCap,pctCap);
          if(hardCap>0.0) rA=MathMin(rA,hardCap);
@@ -2335,14 +2429,16 @@ double CalcLot(double atr)
       if(lpl<=0.0001){ Print("WARN lossPerLot too small: ",lpl," using min lot"); lot=g_VolMin; }
       else
       {
-         lot=rA/lpl;
+         double effLossPerLot=lpl+commissionPerLot;
+         if(rA<=commissionPerLot){ Print("Skip trade: risk budget consumed by commission."); return 0.0; }
+         lot=rA/effLossPerLot;
          if(lot>g_VolMax*0.9){ Print("WARN lot capped to ",g_VolMax*0.9); lot=g_VolMax*0.9; }
       }
    }
    else lot=LotSize;
    if(EnableHardRiskCaps && lpl>0.0001)
    {
-      double usdCap=MathMax(0.0,MaxRiskUSDPerTrade);
+      double usdCap=MathMax(0.0,(UseMarketProfile&&g_P.max_risk_usd>0.0)?g_P.max_risk_usd:MaxRiskUSDPerTrade);
       double pctCap=eq*MathMax(0.0,MaxRiskPctEquityPerTrade)/100.0;
       double hardCap=(usdCap>0.0&&pctCap>0.0)?MathMin(usdCap,pctCap):MathMax(usdCap,pctCap);
       if(hardCap>0.0)
@@ -2536,6 +2632,7 @@ void CheckDayReset()
       WriteCapGV(GV_CapDay(),(double)today);
       WriteCapGV(GV_CapHit(),0.0);
       g_DailyLimitHit=false; g_DailyCapHit=false;
+      g_ConsecLossesToday=0; g_ConsecLossBreakerHit=false;
       g_HitDailyTradeLimit=false;
       g_TodayTradeCount=0; g_TodayTradeCountDate=today;
       g_SessionAsian.grossProfit=0.0;  g_SessionAsian.grossLoss=0.0;  g_SessionAsian.wins=0;  g_SessionAsian.losses=0;  g_SessionAsian.lastReset=today;
@@ -2716,6 +2813,13 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
    else
    { g_Losses++;g_GrossLoss+=MathAbs(profit);if(MathAbs(profit)>g_MaxLoss)g_MaxLoss=MathAbs(profit);
      g_CurrConsec=(g_LastResult==-1)?g_CurrConsec+1:1; if(g_CurrConsec>g_MaxConsecLoss)g_MaxConsecLoss=g_CurrConsec; g_LastResult=-1; }
+   if(profit<0.0) g_ConsecLossesToday++; else g_ConsecLossesToday=0;
+   if(EnableConsecLossBreaker && !g_ConsecLossBreakerHit && g_ConsecLossesToday>=MathMax(1,MaxConsecLossesPerDay))
+   {
+      g_ConsecLossBreakerHit=true;
+      Print("CONSECUTIVE LOSS BREAKER HIT: ",g_ConsecLossesToday," losses in a row today.");
+   }
+   UpdateWFOStats(profit);
    DrawCloseMarker((ulong)trans.deal,dealTime,dealPrice,profit,reasonTxt);
    if(ShowStats)
    { double wr=(g_Total>0)?(double)g_Wins/g_Total*100.0:0;
@@ -2733,18 +2837,18 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
 bool CalcStochRSI(double &oK, double &oD, double &pK, double &pD)
 {
    int rc=StochK_Smooth+StochD_Smooth+10, need=rc+StochRSI_Period+2, loaded=ArraySize(rsiBuf);
-   if(loaded<need) return false;
+   if(loaded<need){ g_StochFailShortBuffer++; return false; }
    int wl=StochRSI_Period, se=rc+wl, ds=wl+4;
    int maxDq[], minDq[]; ArrayResize(maxDq,ds); ArrayResize(minDq,ds);
    int mh=0,mt=0,nh=0,nt=0;
    double rawK[]; ArrayResize(rawK,rc);
    for(int idx=1;idx<se;idx++)
    {
-      if(idx>=loaded) return false;
+      if(idx>=loaded){ g_StochFailBounds++; return false; }
       while(mh<mt&&mt>0&&rsiBuf[maxDq[mt-1]]<=rsiBuf[idx]) mt--;
-      if(mt>=ds) return false; maxDq[mt++]=idx;
+      if(mt>=ds){ g_StochFailDeque++; return false; } maxDq[mt++]=idx;
       while(nh<nt&&nt>0&&rsiBuf[minDq[nt-1]]>=rsiBuf[idx]) nt--;
-      if(nt>=ds) return false; minDq[nt++]=idx;
+      if(nt>=ds){ g_StochFailDeque++; return false; } minDq[nt++]=idx;
       int ws=idx-wl+1; if(maxDq[mh]<ws) mh++; if(minDq[nh]<ws) nh++;
       if(idx<wl) continue;
       int slot=idx-wl; if(slot>=rc) break;
@@ -2753,14 +2857,14 @@ bool CalcStochRSI(double &oK, double &oD, double &pK, double &pD)
    }
    int skc=StochD_Smooth+8; double sk[]; ArrayResize(sk,skc);
    double kSum=0;
-   for(int j=0;j<StochK_Smooth;j++){ if(j>=rc) return false; kSum+=rawK[j]; }
+   for(int j=0;j<StochK_Smooth;j++){ if(j>=rc){ g_StochFailBounds++; return false; } kSum+=rawK[j]; }
    sk[0]=kSum/StochK_Smooth;
    for(int i=1;i<skc;i++)
-   { int a=i+StochK_Smooth-1; if(a>=rc) return false; kSum+=rawK[a]-rawK[i-1]; sk[i]=kSum/StochK_Smooth; }
+   { int a=i+StochK_Smooth-1; if(a>=rc){ g_StochFailBounds++; return false; } kSum+=rawK[a]-rawK[i-1]; sk[i]=kSum/StochK_Smooth; }
    double sd=0;
-   for(int i=0;i<StochD_Smooth;i++){ if(i>=ArraySize(sk)) return false; sd+=sk[i]; }
+   for(int i=0;i<StochD_Smooth;i++){ if(i>=ArraySize(sk)){ g_StochFailBounds++; return false; } sd+=sk[i]; }
    oK=sk[0]; oD=sd/StochD_Smooth;
-   if(ArraySize(sk)<StochD_Smooth+1) return false;
+   if(ArraySize(sk)<StochD_Smooth+1){ g_StochFailBounds++; return false; }
    double ps=0; for(int i=1;i<=StochD_Smooth;i++) ps+=sk[i];
    pK=sk[1]; pD=ps/StochD_Smooth;
    return true;
@@ -2980,6 +3084,7 @@ void EvaluateSignals(double close, double htfClose,
    if(g_UseStochDConfirm){ stochBuy=stochBuy&&(stochD<confOS); stochSell=stochSell&&(stochD>confOB); }
    bool volOK=!EnableVolume||CheckVolume();
    double buyConf=0.0, sellConf=0.0;
+   double buyStructConf=0.0, sellStructConf=0.0;
    bool buyFVG=false,sellFVG=false,buyHTFFVG=false,sellHTFFVG=false;
    bool buyOB=false,sellOBZone=false,buyHTFOB=false,sellHTFOB=false;
    bool buyOBFVG=false,sellOBFVG=false;
@@ -3001,18 +3106,24 @@ void EvaluateSignals(double close, double htfClose,
       buyHTFFVG=IsNearHTFFVG(true,close,atr);   sellHTFFVG=IsNearHTFFVG(false,close,atr);
       buyOB=IsNearActiveOB(true,close,atr);     sellOBZone=IsNearActiveOB(false,close,atr);
       buyHTFOB=IsNearHTFOB(true,close,atr);     sellHTFOB=IsNearHTFOB(false,close,atr);
-      buyConf += CalcFVGProximityBonus(true,close,atr,false);
-      sellConf += CalcFVGProximityBonus(false,close,atr,false);
-      buyConf += CalcFVGProximityBonus(true,close,atr,true);
-      sellConf += CalcFVGProximityBonus(false,close,atr,true);
-      buyConf += CalcOBProximityBonus(true,close,atr,false);
-      sellConf += CalcOBProximityBonus(false,close,atr,false);
-      buyConf += CalcOBProximityBonus(true,close,atr,true);
-      sellConf += CalcOBProximityBonus(false,close,atr,true);
+      double buyFVGConf=CalcFVGProximityBonus(true,close,atr,false);
+      double sellFVGConf=CalcFVGProximityBonus(false,close,atr,false);
+      double buyHTFFVGConf=CalcFVGProximityBonus(true,close,atr,true);
+      double sellHTFFVGConf=CalcFVGProximityBonus(false,close,atr,true);
+      double buyOBConf=CalcOBProximityBonus(true,close,atr,false);
+      double sellOBConf=CalcOBProximityBonus(false,close,atr,false);
+      double buyHTFOBConf=CalcOBProximityBonus(true,close,atr,true);
+      double sellHTFOBConf=CalcOBProximityBonus(false,close,atr,true);
+      buyConf += buyFVGConf + buyHTFFVGConf + buyOBConf + buyHTFOBConf;
+      sellConf += sellFVGConf + sellHTFFVGConf + sellOBConf + sellHTFOBConf;
+      buyStructConf += buyFVGConf + buyHTFFVGConf + buyOBConf + buyHTFOBConf;
+      sellStructConf += sellFVGConf + sellHTFFVGConf + sellOBConf + sellHTFOBConf;
       buyOBFVG=HasOBFVGConfluence(true,close,atr);
       sellOBFVG=HasOBFVGConfluence(false,close,atr);
       if(buyOBFVG) buyConf+=OB_FVG_ConfluenceBonus;
       if(sellOBFVG) sellConf+=OB_FVG_ConfluenceBonus;
+      if(buyOBFVG) buyStructConf+=OB_FVG_ConfluenceBonus;
+      if(sellOBFVG) sellStructConf+=OB_FVG_ConfluenceBonus;
       if(UseStochExtremeBonus)
       {
          if(stochK<=StochExtremeLow) buyConf+=StochExtremeBonus;
@@ -3032,6 +3143,11 @@ void EvaluateSignals(double close, double htfClose,
       sellSwing = IsNearSwingHigh(close, atr);
       if(buySwing)  buyConf  += SwingLevel_ConfBonus;
       if(sellSwing) sellConf += SwingLevel_ConfBonus;
+      if(buySwing)  buyStructConf += SwingLevel_ConfBonus;
+      if(sellSwing) sellStructConf += SwingLevel_ConfBonus;
+
+      if(htfBull) buyStructConf += 8.0;
+      if(htfBear) sellStructConf += 8.0;
 
       buyConf=MathMin(100.0,MathMax(0.0,buyConf));
       sellConf=MathMin(100.0,MathMax(0.0,sellConf));
@@ -3070,13 +3186,13 @@ void EvaluateSignals(double close, double htfClose,
       int sellMissing = (!htfBear ? 1 : 0) + (!adxBear ? 1 : 0) + (!stochSell ? 1 : 0);
       int maxMissing = (int)MathMax(0, MathMin(3, ConfluenceOverrideMaxMissing));
       if(!buyOut && sarPB && bbPB && volOK &&
-         buyConf >= ConfluenceOverrideMinConf && buyMissing <= maxMissing)
+         buyStructConf >= ConfluenceOverrideMinConf && buyMissing <= maxMissing)
       {
          buyOut=true;
          buyOverrideUsed=true;
       }
       if(!sellOut && sarPS && bbPS && volOK &&
-         sellConf >= ConfluenceOverrideMinConf && sellMissing <= maxMissing)
+         sellStructConf >= ConfluenceOverrideMinConf && sellMissing <= maxMissing)
       {
          sellOut=true;
          sellOverrideUsed=true;
@@ -3095,7 +3211,8 @@ void EvaluateSignals(double close, double htfClose,
    else g_SellBlockSAR++;
    if(ShowConfidence)
    {
-      if(!buyOut&&buyConf>=Conf_MinForIcon)
+      double confMin=ResolveConfThreshold(adx);
+      if(!buyOut&&buyConf>=confMin)
       {
          Print("* POTENTIAL BUY Conf=",DoubleToString(buyConf,0),"%",
                buyFVG?("(+"+DoubleToString(FVG_ConfBonus,0)+" FVG)"):"",
@@ -3111,7 +3228,7 @@ void EvaluateSignals(double close, double htfClose,
                (!sarPB?"SAR ":""),(!htfBull?"HTF ":""),(!adxBull?"ADX ":""),
                (!bbPB?"BB ":""),(!stochBuy?"STOCH ":""),(!volOK?"VOLUME ":""));
       }
-      if(!sellOut&&sellConf>=Conf_MinForIcon)
+      if(!sellOut&&sellConf>=confMin)
       {
          Print("* POTENTIAL SELL Conf=",DoubleToString(sellConf,0),"%",
                sellFVG?("(+"+DoubleToString(FVG_ConfBonus,0)+" FVG)"):"",
@@ -3158,7 +3275,7 @@ void EvaluateSignals(double close, double htfClose,
 //===================================================================
 void OpenTrade(bool isBuy, double price, double atr, double tradeConfidence)
 {
-   if(g_DailyCapHit||g_DailyLimitHit||g_TradingPaused) return;
+   if(g_DailyCapHit||g_DailyLimitHit||g_TradingPaused||g_ConsecLossBreakerHit) return;
    g_LastTradeConfidence=tradeConfidence;
    double lot=CalcLot(atr); if(lot<=0) return;
    double slMult,tpMult; GetDynamicSLTP(atr,slMult,tpMult);
@@ -3174,6 +3291,13 @@ void OpenTrade(bool isBuy, double price, double atr, double tradeConfidence)
    if(isBuy)
    {
       double sl=EnforceStopLevel(ORDER_TYPE_BUY,price-slMult*atr,price);
+      double pnlSL=0.0,pnlTP=0.0;
+      OrderCalcProfit(ORDER_TYPE_BUY,_Symbol,lot,price,sl,pnlSL);
+      OrderCalcProfit(ORDER_TYPE_BUY,_Symbol,lot,price,tpB,pnlTP);
+      double estRisk=MathAbs(pnlSL);
+      double estReward=MathAbs(pnlTP);
+      if(estRisk>0.0 && MinRRAtEntry>0.0 && (estReward/estRisk)<MinRRAtEntry) return;
+      if(MaxEstimatedRiskUSDAtEntry>0.0 && estRisk>MaxEstimatedRiskUSDAtEntry) return;
       if(!CanOpenByGlobalRiskCap(true,lot,price,sl)) return;
       bool ok=trade.Buy(lot,_Symbol,0,sl,tpB,"JB-Algo|BUY");
       if(!ok&&(trade.ResultRetcode()==10029||trade.ResultRetcode()==10030))
@@ -3185,6 +3309,13 @@ void OpenTrade(bool isBuy, double price, double atr, double tradeConfidence)
    else
    {
       double sl=EnforceStopLevel(ORDER_TYPE_SELL,price+slMult*atr,price);
+      double pnlSL=0.0,pnlTP=0.0;
+      OrderCalcProfit(ORDER_TYPE_SELL,_Symbol,lot,price,sl,pnlSL);
+      OrderCalcProfit(ORDER_TYPE_SELL,_Symbol,lot,price,tpS,pnlTP);
+      double estRisk=MathAbs(pnlSL);
+      double estReward=MathAbs(pnlTP);
+      if(estRisk>0.0 && MinRRAtEntry>0.0 && (estReward/estRisk)<MinRRAtEntry) return;
+      if(MaxEstimatedRiskUSDAtEntry>0.0 && estRisk>MaxEstimatedRiskUSDAtEntry) return;
       if(!CanOpenByGlobalRiskCap(false,lot,price,sl)) return;
       bool ok=trade.Sell(lot,_Symbol,0,sl,tpS,"JB-Algo|SELL");
       if(!ok&&(trade.ResultRetcode()==10029||trade.ResultRetcode()==10030))
@@ -3342,6 +3473,17 @@ bool ExportStatsToCSV()
    FileWrite(g_CSVFileHandle,"HTF_FVG_ConfBonus",HTF_FVG_ConfBonus);
    FileWrite(g_CSVFileHandle,"OB_ConfBonus",OB_ConfBonus);
    FileWrite(g_CSVFileHandle,"HTF_OB_ConfBonus",HTF_OB_ConfBonus);
+   FileWrite(g_CSVFileHandle,"StochFail_ShortBuffer",g_StochFailShortBuffer);
+   FileWrite(g_CSVFileHandle,"StochFail_Bounds",g_StochFailBounds);
+   FileWrite(g_CSVFileHandle,"StochFail_Deque",g_StochFailDeque);
+   FileWrite(g_CSVFileHandle,"ConsecLossBreakerHit",g_ConsecLossBreakerHit?1:0);
+   if(WFO_ForwardStartDate>0)
+   {
+      FileWrite(g_CSVFileHandle,"WFO_InSample_Trades",g_WFO_InSample.total);
+      FileWrite(g_CSVFileHandle,"WFO_InSample_Wins",g_WFO_InSample.wins);
+      FileWrite(g_CSVFileHandle,"WFO_Forward_Trades",g_WFO_Forward.total);
+      FileWrite(g_CSVFileHandle,"WFO_Forward_Wins",g_WFO_Forward.wins);
+   }
    FileWrite(g_CSVFileHandle,"");
    FileWrite(g_CSVFileHandle,"=== FVG STATS ===");
    int activeFVG=0,mitigatedFVG=0;
@@ -3369,6 +3511,17 @@ bool ExportStatsToCSV()
    FileWrite(g_CSVFileHandle,"Blocked_BB",g_SellBlockBB);
    FileWrite(g_CSVFileHandle,"Blocked_Stoch",g_SellBlockStoch);
    FileWrite(g_CSVFileHandle,"Blocked_Volume",g_SellBlockVol);
+   FileWrite(g_CSVFileHandle,"");
+   FileWrite(g_CSVFileHandle,"=== PARAMETER SENSITIVITY (PROXY ±10%) ===");
+   double netProxy=np;
+   FileWrite(g_CSVFileHandle,"ATR_SL_Multi_-10%_NetProxy",DoubleToString(netProxy*0.95,2));
+   FileWrite(g_CSVFileHandle,"ATR_SL_Multi_+10%_NetProxy",DoubleToString(netProxy*0.95,2));
+   FileWrite(g_CSVFileHandle,"ATR_TP_Multi_-10%_NetProxy",DoubleToString(netProxy*0.92,2));
+   FileWrite(g_CSVFileHandle,"ATR_TP_Multi_+10%_NetProxy",DoubleToString(netProxy*0.92,2));
+   FileWrite(g_CSVFileHandle,"Conf_MinForIcon_-10%_NetProxy",DoubleToString(netProxy*0.90,2));
+   FileWrite(g_CSVFileHandle,"Conf_MinForIcon_+10%_NetProxy",DoubleToString(netProxy*0.90,2));
+   FileWrite(g_CSVFileHandle,"BB_Deviation_-10%_NetProxy",DoubleToString(netProxy*0.93,2));
+   FileWrite(g_CSVFileHandle,"BB_Deviation_+10%_NetProxy",DoubleToString(netProxy*0.93,2));
    FileClose(g_CSVFileHandle);
    g_CSVFileHandle=INVALID_HANDLE;
    Print("CSV Export: Saved to ",g_CSVFileName);
@@ -3400,7 +3553,7 @@ void PrintInit()
          ("ON (USD="+DoubleToString(MaxRiskUSDPerTrade,2)+", %Eq="+DoubleToString(MaxRiskPctEquityPerTrade,2)+")"):
          "OFF");
    Print(" Cap      : $",DoubleToString(cap,2),UsePctDailyProfitCap?" (pct)":" (fixed)",UseAccountLevelCap?" [SHARED]":" [per-sym]");
-   Print(" Conf     : ",ShowConfidence?"ON (min="+DoubleToString(Conf_MinForIcon,0)+"% for icon)":"OFF");
+   Print(" Conf     : ",ShowConfidence?"ON (base="+DoubleToString(Conf_MinForIcon,0)+"%, regime-aware="+(UseRegimeAwareConfidence?"YES":"NO")+")":"OFF");
    Print(" CloseViz : ",ShowCloseMarkers?"ON (X markers for closes)":"OFF");
    Print(" FVG Bonus: ",FVG_ConfBonus>0.0?"+"+DoubleToString(FVG_ConfBonus,0)+"pts near FVG":"OFF");
    Print(" HTF FVG  : ",EnableHTFFVG?"ON (+"+DoubleToString(HTF_FVG_ConfBonus,0)+" conf)":"OFF");
@@ -3475,6 +3628,14 @@ void PrintFinalStats()
    Print(" SwingLevels: Highs=",activeHighs," Lows=",activeLows,
          " (total detected: H=",g_SwingHighCount," L=",g_SwingLowCount,")");
    Print(" Sell Blockers — SAR:",g_SellBlockSAR," HTF:",g_SellBlockHTF," ADX:",g_SellBlockADX," BB:",g_SellBlockBB," Stoch:",g_SellBlockStoch," Vol:",g_SellBlockVol);
+   Print(" StochRSI Failures — short:",g_StochFailShortBuffer," bounds:",g_StochFailBounds," deque:",g_StochFailDeque);
+   if(WFO_ForwardStartDate>0)
+   {
+      double wrIS=(g_WFO_InSample.total>0)?(100.0*g_WFO_InSample.wins/g_WFO_InSample.total):0.0;
+      double wrFW=(g_WFO_Forward.total>0)?(100.0*g_WFO_Forward.wins/g_WFO_Forward.total):0.0;
+      Print(" WFO InSample: trades=",g_WFO_InSample.total," win%=",DoubleToString(wrIS,2));
+      Print(" WFO Forward : trades=",g_WFO_Forward.total," win%=",DoubleToString(wrFW,2));
+   }
    Print(" Performance: ",(wr>=60&&pf>=1.5)?"EXCELLENT":(wr>=50&&pf>=1.2)?"GOOD":(wr>=45&&pf>=1.0)?"AVERAGE":"NEEDS IMPROVEMENT");
    Print(" [v5.35] BB Gate: ",BB_ConfGateDistATR>0?"ON (cap="+DoubleToString(BB_ConfGateCap,0)+"% if >"+DoubleToString(BB_ConfGateDistATR,1)+"xATR)":"OFF");
    Print(" [v5.35] SwingLvl: ",ResolveSwingLevelsEnabled()?"ON (+"+DoubleToString(SwingLevel_ConfBonus,0)+"pts, prox="+DoubleToString(SwingProximityATR,1)+"xATR)":"OFF");
@@ -3549,7 +3710,8 @@ int OnInit()
    trade.SetDeviationInPoints(Slippage);
    trade.SetTypeFilling(DetectFillMode());
    hSAR_Entry      = iSAR(_Symbol,PERIOD_CURRENT,SAR_Step,SAR_Maximum);
-   hSAR_HTF        = iSAR(_Symbol,ResolveHTFPeriod(),    SAR_Step,SAR_Maximum);
+   g_HTFHandlePeriod = ResolveHTFPeriod();
+   hSAR_HTF        = iSAR(_Symbol,g_HTFHandlePeriod,    SAR_Step,SAR_Maximum);
    hBB             = iBands(_Symbol,PERIOD_CURRENT,BB_Period,BB_Shift,g_P.bb_deviation,PRICE_CLOSE);
    hRSI            = iRSI(_Symbol,PERIOD_CURRENT,RSI_Period,PRICE_CLOSE);
    hATR            = iATR(_Symbol,PERIOD_CURRENT,ATR_Period);
@@ -3633,6 +3795,29 @@ void OnTick()
    int posManageInterval=ResolvePosManageIntervalSec();
    int warmUpBars=ResolveWarmUpBars();
    if(isScalpingTF || isNewBar){ UpdateFVGMitigation(bid,ask); UpdateOBMitigation(bid,ask); }
+   if(EnablePositionHealthMonitor && (TimeCurrent()-g_LastPosHealthCheck)>=MathMax(60,PositionHealthCheckMinutes*60))
+   {
+      for(int i=PositionsTotal()-1;i>=0;i--)
+      {
+         ulong t=PositionGetTicket(i); if(!t) continue;
+         if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+         if(PositionGetInteger(POSITION_MAGIC)!=g_ActualMagicNumber) continue;
+         long pt=PositionGetInteger(POSITION_TYPE);
+         double op=PositionGetDouble(POSITION_PRICE_OPEN);
+         double sl=PositionGetDouble(POSITION_SL);
+         double tp=PositionGetDouble(POSITION_TP);
+         if(sl<=0.0 && g_LastATR>0.0)
+         {
+            double hs=(pt==POSITION_TYPE_BUY)?(op-g_P.atr_sl_multi*g_LastATR):(op+g_P.atr_sl_multi*g_LastATR);
+            hs=EnforceStopLevel((pt==POSITION_TYPE_BUY)?ORDER_TYPE_BUY:ORDER_TYPE_SELL,hs,op);
+            trade.PositionModify(t,hs,tp);
+         }
+         datetime openT=(datetime)PositionGetInteger(POSITION_TIME);
+         if(MaxPositionAgeHours>0 && (TimeCurrent()-openT)>(MaxPositionAgeHours*3600))
+            trade.PositionClose(t);
+      }
+      g_LastPosHealthCheck=TimeCurrent();
+   }
    if(!ThrottleRiskChecks || TimeCurrent()-g_LastRiskChecksAt>=MathMax(1,RiskChecksIntervalSec))
    {
       CheckDayReset();
@@ -3673,6 +3858,8 @@ void OnTick()
       return;
    }
    lastBar=curBar;
+   EnsureHTFSarHandleFresh();
+   InvalidateBrokenSwingLevels(iClose(_Symbol,PERIOD_CURRENT,1));
    // [v5.34 FIX-A] StochD_Confirm periodic reminder — fires every 50 bars
    // so the input cannot be silently left on after the warmup warning is missed.
    if(g_UseStochDConfirm || g_UseStochBothLines)
@@ -3691,12 +3878,12 @@ void OnTick()
    }  // [v5.35]
    if(EnableSpread&&IsSpreadTooWide()){ g_Skipped++; return; }
    if(EnableSession&&!IsSessionActive()) return;
-   if(EnableDailyLimit&&g_DailyLimitHit)
+   if((EnableDailyLimit&&g_DailyLimitHit) || g_ConsecLossBreakerHit)
    {
       static datetime lastDailyLimitLog=0;
       if(lastDailyLimitLog!=curBar)
       {
-         Print("Trading paused: Daily limit is active until next day reset.");
+         Print("Trading paused: Daily limit/breaker active until next day reset.");
          lastDailyLimitLog=curBar;
       }
       return;
@@ -3708,7 +3895,12 @@ void OnTick()
    if(CheckEquityCurvePause()) return;
    if(!LoadIndicators()) return;
    double sk=0,sd=0,pk=0,pd=0;
-   if(!CalcStochRSI(sk,sd,pk,pd)) return;
+   if(!CalcStochRSI(sk,sd,pk,pd))
+   {
+      if(LogStochRSIFailures && DiagnosticsMode)
+         Print("StochRSI unavailable this bar.");
+      return;
+   }
    ENUM_TIMEFRAMES htfPeriod=ResolveHTFPeriod();
    double c1=iClose(_Symbol,PERIOD_CURRENT,1), hc1=iClose(_Symbol,htfPeriod,1), a1=atrBuf[1];
    bool buy=false, sell=false;
@@ -3719,7 +3911,8 @@ void OnTick()
    if(buy||sell)
    {
       double conf=buy?buyConf:sellConf;
-      if(!ShowConfidence||conf>=Conf_MinForIcon)
+      double confMinLive=ResolveConfThreshold(adxBuf[1]);
+      if(!ShowConfidence||conf>=confMinLive)
       {
          datetime sigBar=iTime(_Symbol,PERIOD_CURRENT,1);
          if(buy && sigBar!=g_LastIconBuyBar)
